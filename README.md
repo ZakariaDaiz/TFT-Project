@@ -1,13 +1,21 @@
-# PH Teamfight Tactics Data Analysis
+# PH Teamfight Tactics Data Analysis (Upgrade)
+
+## Introduction & Goal
+
+This project is a modernization and upgrade of the existing [PH-TFT project](https://github.com/rndmagtanong/ph_tft). The goal is to rework the core components to meet today's standards and improve performance.
+
+**Main improvements:**
+*   **ETL Rework:** Updating the Extract, Transform, Load pipeline to be fully compatible with the current Riot Games API.
+*   **Model Training Upgrade:** Transitioning from a standard confusion matrix approach to **CatBoost** (with GX training) to significantly increase prediction accuracy.
 
 ## TL;DR
 
-An ETL pipeline was built to get match data of PH Challenger/GM+ players for the game Teamfight Tactics using the Riot Developer API. The data is then preprocessed into .csv files and analyzed with data analysis techniques. Afterwards, a model is trained to  predict where a certain combination of units/traits/items would place if played in-game.
+An ETL pipeline was built to get match data of PH Challenger/GM+ players for the game Teamfight Tactics using the Riot Developer API. The data is then preprocessed into .csv files and analyzed with data analysis techniques. Afterwards, a model is trained to predict where a certain combination of units/traits/items would place if played in-game.
 
 ## Code and Resources Used
 
 - Python Version: 3.10
-- Packages: matplotlib, numpy, pandas, re, requests, seaborn, sklearn, flatten_json
+- Packages: matplotlib, numpy, pandas, re, requests, seaborn, sklearn, flatten_json, catboost
 - Riot Developer API: https://developer.riotgames.com/apis
 
 ## Table of Contents
@@ -55,7 +63,7 @@ First, the data from the best players is combined, and duplicates are removed to
 
 The placement of a player is then selected as the target. To see the effects, this placement is then binned 3 ways: by 1st to 8th place, by 2 places (e.g. [1st, 2nd], [3rd, 4th]...), and by whether it is a Top 4 (a win) or a Bot 4 (a loss). Train-test splits for these three were then created.
 
-A `RandomForestClassifier` model was used since placements are discrete values. To get the best parameters, `GridSearchCV` was used to iterate through all the combinations of parameters given in `param_grid`. Once finished, the training data is fit to this model and scored according to its accuracy, mean absolute error, and through a confusion matrix. This is then repeated for each classification bin.
+A **CatBoost** model (with GX training) is used to improve prediction accuracy, replacing the previous RandomForestClassifier approach. CatBoost is particularly well-suited for handling categorical data and providing high accuracy in ranking tasks.
 
 ![8 Bins](confusion_matrixes/confusion_matrix_8.png)
 

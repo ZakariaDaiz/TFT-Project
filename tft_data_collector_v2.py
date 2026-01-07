@@ -1,501 +1,308 @@
 import os
 import time
-import pandas as pd
+import requests
+import psycopg2
+from psycopg2.extras import Json
 from riotwatcher import TftWatcher, ApiError
-from flatten_json import flatten
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.pipeline import Pipeline
-from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional, Set
-import logging
-from pathlib import Path
-
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('tft_collector.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-load_dotenv()
-
-API_KEY = os.environ.get('RIOT_API_KEY')
-if not API_KEY:
-    logger.error("RIOT_API_KEY environment variable not set!")
-    raise ValueError("RIOT_API_KEY is required")
-
+API_KEY = 'RGAPI-YOUR-KEY-HERE' # REPLACE THIS
 PLATFORM_REGION = 'euw1'
 MATCH_REGION = 'europe'
 
-# Performance tuning
-MAX_WORKERS_PUUID = 15  # Increased for better parallelization
-MAX_WORKERS_MATCHES = 20
-MAX_WORKERS_MATCH_DATA = 5
-BATCH_SIZE = 100  # Process in batches for better progress tracking
+# PostgreSQL Configuration
+DB_HOST = "localhost"
+DB_NAME = "tft_data"
+DB_USER = "postgres"
+DB_PASS = "password"
 
-watcher = TftWatcher(API_KEY)
+# --- Data Dragon / Static Data from riot's official site ---
 
-# --- Helper Functions ---
-
-def get_challengers(region: str = PLATFORM_REGION) -> List[Dict]:
-    """Fetch Challenger league entries."""
-    logger.info(f"Fetching Challengers for {region}...")
+def get_latest_ddragon_version():
+    """Fetch the latest Data Dragon version."""
     try:
-        challengers = watcher.league.challenger(region)
-        entries = challengers.get('entries', [])
-        logger.info(f"Found {len(entries)} Challenger players")
-        return entries
-    except ApiError as err:
-        logger.error(f"API Error fetching challengers: {err}")
-        return []
-    except Exception as err:
-        logger.error(f"Unexpected error fetching challengers: {err}")
-        return []
+        versions = requests.get("https://ddragon.leagueoflegends.com/api/versions.json").json()
+        return versions[0]
+    except Exception as e:
+        print(f"Error getting DDragon version, defaulting to latest known: {e}")
+        return "14.1.1" # Fallback
 
-
-def get_gms(region: str = PLATFORM_REGION) -> List[Dict]:
-    """Fetch Grandmaster league entries."""
-    logger.info(f"Fetching Grandmasters for {region}...")
+def load_tft_static_data():
+    """
+    Fetches TFT data from Data Dragon to map IDs (TFT13_Sion) to Names (Sion).
+    Returns dictionaries for champions and items.
+    """
+    version = get_latest_ddragon_version()
+    print(f"Using Data Dragon Version: {version}")
+    
+    # 1. Champions values
+    champ_map = {}
     try:
-        gms = watcher.league.grandmaster(region)
-        entries = gms.get('entries', [])
-        logger.info(f"Found {len(entries)} Grandmaster players")
-        return entries
-    except ApiError as err:
-        logger.error(f"API Error fetching grandmasters: {err}")
-        return []
-    except Exception as err:
-        logger.error(f"Unexpected error fetching grandmasters: {err}")
-        return []
+        url = f"http://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/tft-champion.json"
+        data = requests.get(url).json()
+        for champ_id, champ_data in data['data'].items():
+            # Mapping: "TFT13_Sion" -> "Sion"
+            champ_map[champ_id] = champ_data.get('name', champ_id)
+    except Exception as e:
+        print(f"Error loading champion data: {e}")
 
+    # 2. Items values
+    item_map = {}
+    try:
+        url = f"http://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/tft-item.json"
+        data = requests.get(url).json()
+        for item_id, item_data in data['data'].items():
+            item_map[item_id] = item_data.get('name', item_id)
+    except Exception as e:
+        print(f"Error loading item data: {e}")
+        
+    return champ_map, item_map
 
-def resolve_puuid_single(entry: Dict, region: str) -> Optional[str]:
-    """Resolve a single PUUID with retry logic."""
-    if 'puuid' in entry:
-        return entry['puuid']
+# --- Database Setup ---
+
+def get_db_connection():
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS
+    )
+    return conn
+
+def init_db():
+    """Create necessary tables if they don't exist."""
+    conn = get_db_connection()
+    cur = conn.cursor()
     
-    summoner_id = entry.get('summonerId')
-    if not summoner_id:
-        return None
+    # Matches Table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_metadata (
+            match_id VARCHAR(50) PRIMARY KEY,
+            data_version VARCHAR(20),
+            game_datetime BIGINT,
+            game_length FLOAT,
+            game_version VARCHAR(100)
+        );
+    """)
     
-    max_retries = 3
-    for attempt in range(max_retries):
+    # Participants Table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS participants (
+            id SERIAL PRIMARY KEY,
+            match_id VARCHAR(50) REFERENCES match_metadata(match_id),
+            puuid VARCHAR(100),
+            placement INT,
+            level INT,
+            gold_left INT,
+            last_round INT,
+            time_eliminated FLOAT,
+            augments JSONB,  -- Storing augments as JSON array
+            traits JSONB,    -- Storing active traits as JSON
+            units JSONB      -- Storing units and their items as JSON
+        );
+    """)
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("Database initialized.")
+
+# --- ETL ---
+
+class TftETL:
+    def __init__(self, api_key, region, match_region):
+        self.watcher = TftWatcher(api_key)
+        self.region = region
+        self.match_region = match_region
+        self.champ_map, self.item_map = load_tft_static_data()
+        
+    def resolve_name(self, internal_id):
+        """Resolves TFT13_Sion -> Sion using loaded map."""
+        return self.champ_map.get(internal_id, internal_id)
+
+    def resolve_item(self, item_id):
+        """Resolves item ID/Name -> Display Name."""
+        # DDragon items can be keyed by ID number or string ID
+        # We try to lookup directly
+        return self.item_map.get(str(item_id), str(item_id))
+
+    def extract_league_players(self, tier='challenger'):
+        """Extracts PUUIDs from a specific league tier."""
+        print(f"Extracting {tier} players...")
+        players = []
         try:
-            summoner_dto = watcher.summoner.by_id(region, summoner_id)
-            return summoner_dto.get('puuid')
-        except ApiError as err:
-            if err.response.status_code == 429:  # Rate limit
-                wait_time = 2 ** attempt
-                logger.warning(f"Rate limited, waiting {wait_time}s...")
-                time.sleep(wait_time)
+            if tier == 'challenger':
+                league = self.watcher.league.challenger(self.region)
+            elif tier == 'grandmaster':
+                league = self.watcher.league.grandmaster(self.region)
             else:
-                logger.debug(f"Failed to resolve {summoner_id}: {err}")
-                return None
-        except Exception as err:
-            logger.debug(f"Error resolving {summoner_id}: {err}")
-            return None
-    return None
+                return []
+            
+            entries = league.get('entries', [])
+            print(f"Found {len(entries)} entries in {tier}.")
+            
+            # For testing, verify first 5
+            for entry in entries[:5]: 
+                summ_id = entry['summonerId']
+                try:
+                    summoner = self.watcher.summoner.by_id(self.region, summ_id)
+                    players.append(summoner['puuid'])
+                except ApiError as e:
+                    if e.response.status_code == 429:
+                        print("Rate limit hit during summoner lookup. Sleeping...")
+                        time.sleep(5)
+                    else:
+                        print(f"Error resolving summoner {summ_id}: {e}")
+                time.sleep(0.5) # Courtesy sleep
+                
+        except ApiError as e:
+            print(f"Error fetching league {tier}: {e}")
+            
+        return players
 
+    def extract_matches(self, puuids, count=20):
+        """Get unique match IDs for a list of PUUIDs."""
+        match_ids = set()
+        print(f"Fetching matches for {len(puuids)} players...")
+        
+        for i, puuid in enumerate(puuids):
+            try:
+                ids = self.watcher.match.by_puuid(self.match_region, puuid, count=count)
+                match_ids.update(ids)
+                if i % 5 == 0:
+                    print(f"Processed {i+1}/{len(puuids)} players. Total unique matches: {len(match_ids)}")
+            except ApiError as e:
+                print(f"Error fetching matches for {puuid}: {e}")
+            time.sleep(0.5)
+            
+        return list(match_ids)
 
-def resolve_puuids(entries: List[Dict], region: str = PLATFORM_REGION) -> List[str]:
-    """Resolve PUUIDs in parallel with progress tracking."""
-    logger.info(f"Resolving PUUIDs for {len(entries)} players...")
-    puuids = []
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_PUUID) as executor:
-        future_to_entry = {
-            executor.submit(resolve_puuid_single, entry, region): entry 
-            for entry in entries
+    def transform_match(self, match_data, match_id):
+        """
+        Cleans and maps raw API data to our DB schema structure.
+        Resolves unit names and item names.
+        """
+        info = match_data['info']
+        
+        # 1. Metadata
+        metadata = {
+            'match_id': match_id,
+            'data_version': match_data.get('metadata', {}).get('data_version'),
+            'game_datetime': info['game_datetime'],
+            'game_length': info['game_length'],
+            'game_version': info['game_version']
         }
         
-        completed = 0
-        for future in as_completed(future_to_entry):
-            result = future.result()
-            if result:
-                puuids.append(result)
+        # 2. Participants
+        participants = []
+        for p in info['participants']:
+            # Transform Units: Map "TFT13_Sion" -> "Sion"
+            mapped_units = []
+            for u in p.get('units', []):
+                u_name = self.resolve_name(u.get('character_id'))
+                
+                # Transform Items inside Units
+                u_items = [self.resolve_item(item) for item in u.get('itemNames', [])]
+                
+                mapped_units.append({
+                    'name': u_name,
+                    'tier': u.get('tier'),
+                    'items': u_items,
+                    'rarity': u.get('rarity')
+                })
             
-            completed += 1
-            if completed % 50 == 0 or completed == len(entries):
-                logger.info(f"Resolved {completed}/{len(entries)} PUUIDs ({len(puuids)} successful)")
-    
-    logger.info(f"Successfully resolved {len(puuids)}/{len(entries)} PUUIDs")
-    return puuids
-
-
-def get_match_ids_single(puuid: str, region: str, count: int) -> List[str]:
-    try:
-        return watcher.match.by_puuid(region, puuid, count=count)
-    except ApiError as err:
-        logger.debug(f"API error for PUUID {puuid[:8]}...: {err}")
-        return []
-    except Exception as err:
-        logger.debug(f"Error fetching matches for {puuid[:8]}...: {err}")
-        return []
-
-
-def get_match_ids(puuids: List[str], region: str = MATCH_REGION, count: int = 20) -> List[str]:
-    """Fetch match IDs in parallel with deduplication."""
-    logger.info(f"Fetching Match IDs for {len(puuids)} PUUIDs (up to {count} per player)...")
-    all_match_ids: Set[str] = set()
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_MATCHES) as executor:   
-        future_to_puuid = {
-            executor.submit(get_match_ids_single, puuid, region, count): puuid
-            for puuid in puuids
-        }
-        
-        completed = 0
-        for future in as_completed(future_to_puuid):
-            ids = future.result()
-            all_match_ids.update(ids)
-            
-            completed += 1
-            if completed % 100 == 0 or completed == len(puuids):
-                logger.info(f"Fetched matches for {completed}/{len(puuids)} players (Total unique: {len(all_match_ids)})")
-    
-    match_ids_list = list(all_match_ids)
-    logger.info(f"Found {len(match_ids_list)} unique matches")
-    return match_ids_list
-
-
-def get_match_data_single(match_id: str, region: str) -> List[Dict]:
-    """
-    Fetch a single match and return its participant data ONLY if it is a Ranked Set 13 match.
-    """
-    try:
-        # 1. Fetch the full match details
-        match_dto = watcher.match.by_id(region, match_id)
-        
-        # 2. CRITICAL FILTER: Check the Queue ID
-        # 1100 = Ranked TFT (Standard)
-        # If it's not 1100 (e.g., 6100 for Revival), return empty list immediately.
-        if match_dto['info']['queue_id'] != 1100:
-            return []
-
-        # 3. Flatten the JSON
-        flat_match = flatten(match_dto)
-        rows = []
-        
-        # 4. Extract data for each of the 8 participants
-        for p_idx in range(8):
-            prefix = f'info_participants_{p_idx}'
-            
-            # Filter keys for this specific participant
-            player_data = {k: v for k, v in flat_match.items() if k.startswith(prefix)}
-            
-            if not player_data:
-                continue
-            
-            # Clean up keys (remove "info_participants_0_" prefix)
-            clean_player_data = {
-                k.replace(f'{prefix}_', ''): v 
-                for k, v in player_data.items()
+            p_data = {
+                'match_id': match_id,
+                'puuid': p['puuid'],
+                'placement': p['placement'],
+                'level': p['level'],
+                'gold_left': p['gold_left'],
+                'last_round': p['last_round'],
+                'time_eliminated': p['time_eliminated'],
+                'augments': p.get('augments', []),
+                'traits': p.get('traits', []),
+                'units': mapped_units
             }
+            participants.append(p_data)
             
-            # Add Match Metadata (so we know which game this row belongs to)
-            clean_player_data['match_id'] = match_id
-            clean_player_data['game_datetime'] = flat_match.get('info_game_datetime')
-            clean_player_data['game_version'] = flat_match.get('info_game_version')
-            clean_player_data['queue_id'] = flat_match.get('info_queue_id')
-            clean_player_data['tft_set_number'] = flat_match.get('info_tft_set_number')
-            
-            rows.append(clean_player_data)
+        return metadata, participants
+
+    def load_to_postgres(self, metadata, participants):
+        """Inserts transformed data into PostgreSQL."""
+        conn = get_db_connection()
+        cur = conn.cursor()
         
-        return rows
-
-    except ApiError as err:
-        # Handle 404s or other API errors gracefully
-        if err.response.status_code == 404:
-            logger.debug(f"Match {match_id} not found.")
-        else:
-            logger.debug(f"API error for match {match_id}: {err}")
-        return []
-        
-    except Exception as err:
-        logger.debug(f"Error processing match {match_id}: {err}")
-        return []
-
-
-def get_match_data(match_ids: List[str], region: str = MATCH_REGION) -> pd.DataFrame:
-    """
-    Fetch data for a list of matches in parallel, filtering for Ranked games.
-    """
-    logger.info(f"Fetching data for {len(match_ids)} matches...")
-    match_data_rows = []
-    
-    # Reduced workers to prevent hitting Rate Limits (429) too quickly
-    # If you have a production key, you can increase this.
-    SAFE_WORKER_COUNT = 5 
-    
-    with ThreadPoolExecutor(max_workers=SAFE_WORKER_COUNT) as executor:
-        future_to_match = {
-            executor.submit(get_match_data_single, match_id, region): match_id 
-            for match_id in match_ids
-        }
-        
-        completed = 0
-        for future in as_completed(future_to_match):
-            result_rows = future.result()
+        try:
+            # 1. Insert Metadata
+            cur.execute("""
+                INSERT INTO match_metadata (match_id, data_version, game_datetime, game_length, game_version)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (match_id) DO NOTHING;
+            """, (metadata['match_id'], metadata['data_version'], metadata['game_datetime'], 
+                  metadata['game_length'], metadata['game_version']))
             
-            # result_rows will be empty [] if it was the wrong Queue ID
-            if result_rows:
-                match_data_rows.extend(result_rows)
+            # 2. Insert Participants
+            # Only insert if match didn't exist (checked by metadata conflict) 
+            # or handle duplicates appropriately. Here we assume new matches.
+            for p in participants:
+                cur.execute("""
+                    INSERT INTO participants (match_id, puuid, placement, level, gold_left, last_round, time_eliminated, augments, traits, units)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, (p['match_id'], p['puuid'], p['placement'], p['level'], p['gold_left'], 
+                      p['last_round'], p['time_eliminated'], Json(p['augments']), Json(p['traits']), Json(p['units'])))
             
-            completed += 1
-            if completed % 50 == 0 or completed == len(match_ids):
-                logger.info(f"Processed {completed}/{len(match_ids)} matches. Collected {len(match_data_rows)} ranked player records so far.")
-    
-    if not match_data_rows:
-        logger.warning("No ranked matches found in this batch!")
-        return pd.DataFrame()
+            conn.commit()
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"Error saving match {metadata['match_id']}: {e}")
+        finally:
+            cur.close()
+            conn.close()
 
-    df = pd.DataFrame(match_data_rows)
-    logger.info(f"Created DataFrame with {len(df)} total ranked player records")
-    return df
+    def run(self):
+        print("Starting ETL Process...")
+        
+        # 1. Initialize DB
+        try:
+            init_db()
+        except Exception as e:
+            print(f"DB Connection failed: {e}. Please check your DB credentials.")
+            return
 
-def save_checkpoint(data: pd.DataFrame, tier: str, checkpoint_dir: str = 'checkpoints'):
-    """Save intermediate data checkpoint."""
-    Path(checkpoint_dir).mkdir(exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filepath = f"{checkpoint_dir}/{tier}_{timestamp}.csv"
-    data.to_csv(filepath, index=False)
-    logger.info(f"Checkpoint saved: {filepath}")
-
-class DoubleUpDropper(BaseEstimator, TransformerMixin):
-
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        return X[X['partner_group_id'].isnull()]
-    
-class NaNDropper(BaseEstimator, TransformerMixin):
-
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        return X.dropna(how = 'all').dropna(axis = 'columns', how = 'all')
-    
-class CorruptedDropper(BaseEstimator, TransformerMixin):
-
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        corrupted_features = ['units_5_items_0', 'units_5_items_1',	
-                            'units_5_items_2', 'units_6_items_0',
-                            'units_6_items_1', 'units_6_items_2',
-                            'units_7_items_0', 'units_7_items_1',	
-                            'units_7_items_2', 'units_3_items_0',
-                            'units_3_items_1', 'units_0_items_0',
-                            'units_1_items_0', 'units_1_items_1',	
-                            'units_2_items_0', 'units_2_items_1',	
-                            'units_2_items_2', 'units_1_items_2',
-                            'units_4_items_0', 'units_4_items_1',	
-                            'units_4_items_2', 'units_0_items_1',	
-                            'units_3_items_2', 'units_0_items_2',	
-                            'units_8_items_0', 'units_8_items_1',	
-                            'units_8_items_2']
-        for feature in corrupted_features:
+        # 2. Extract Players
+        challengers = self.extract_league_players('challenger')
+        grandmasters = self.extract_league_players('grandmaster')
+        all_puuids = list(set(challengers + grandmasters))
+        
+        # 3. Extract Match IDs
+        match_ids = self.extract_matches(all_puuids, count=10) # Reduced count for demo
+        
+        # 4. Process Matches (Extract -> Transform -> Load)
+        print(f"Processing {len(match_ids)} matches...")
+        for i, match_id in enumerate(match_ids):
             try:
-                X = X.drop(feature, axis = 'columns')
-            except:
-                continue
-
-        return X
+                # Extract
+                match_data = self.watcher.match.by_id(self.match_region, match_id)
+                
+                # Transform
+                metadata, participants = self.transform_match(match_data, match_id)
+                
+                # Load
+                self.load_to_postgres(metadata, participants)
+                
+                if i % 10 == 0:
+                    print(f"Saved {i}/{len(match_ids)} matches to DB.")
+                    
+            except ApiError as e:
+                print(f"Failed to fetch/save match {match_id}: {e}")
+                time.sleep(1) # Error backoff
         
-class ResetIndex(BaseEstimator, TransformerMixin):
-
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        return X.reset_index(drop = True)
-
-class DescribeMissing(BaseEstimator, TransformerMixin):
-    
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        # get number of missing data points per column
-        missing_values_count = X.isnull().sum()
-
-        # how many missing values do we have?
-        total_cells = np.product(X.shape)
-        total_missing = missing_values_count.sum()
-
-        # percent of missing data
-        percent_missing = (total_missing / total_cells) * 100
-        print('Percent Missing of Data: ' + str(percent_missing))
-
-        return X
-
-class TrainDropper(BaseEstimator, TransformerMixin):
-
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        # remove features that don't help with training the data
-        non_training_features = ['companion_content_ID', 'companion_item_ID',
-                                'companion_skin_ID', 'companion_species',
-                                'players_eliminated']
-        
-        for feature in non_training_features:
-            try:
-                X = X.drop(feature, axis = 'columns')
-            except:
-                continue
-        
-        return X
-    
-class OutlierRemover(BaseEstimator, TransformerMixin):
-
-    def fit(self, X, y = None):
-        return self
-    
-    def transform(self, X):
-        # remove outliers (10% threshold to not remove level 8 data)
-        threshold = int(len(X) * 0.1)
-        X = X.dropna(axis = 1, thresh = threshold)
-        
-        return X
-        
-class AugmentDropper(BaseEstimator, TransformerMixin):
-    """Removes all columns related to Augments."""
-    def fit(self, X, y=None):
-        return self
-    def transform(self, X):
-        # Drop columns containing 'augment' (case insensitive)
-        cols_to_drop = [c for c in X.columns if 'augment' in c.lower()]
-        if cols_to_drop:
-            print(f"Dropping {len(cols_to_drop)} augment columns.")
-            X = X.drop(columns=cols_to_drop)
-        return X
-
-def use_data_pipeline(df: pd.DataFrame, filename: str):
-    """Process data through analysis and ML pipelines."""
-    logger.info(f"Running data pipeline for {filename}...")
-    
-    if df.empty:
-        logger.warning(f"Empty DataFrame for {filename}, skipping pipeline")
-        return None
-    
-    # Analysis Pipeline
-    try:
-        pipe_analysis = Pipeline([
-           ("double_up_dropper", DoubleUpDropper()),
-           ("nandrop", NaNDropper()),
-           ("corruptdropper", CorruptedDropper()),
-           ("resetindex", ResetIndex()),
-           ("nanpercent", DescribeMissing()),
-           ("augmentdropper", AugmentDropper())
-        ])
-        
-        df_analysis = pipe_analysis.fit_transform(df)
-        
-        # Save unprocessed data
-        Path('data').mkdir(exist_ok=True)
-        output_path_unprocessed = f'data/unprocessed_{filename}.csv'
-        df_analysis.to_csv(output_path_unprocessed, index=False)
-        logger.info(f"Saved analysis data: {output_path_unprocessed} ({len(df_analysis)} rows)")
-    except Exception as err:
-        logger.error(f"Error in analysis pipeline: {err}")
-        return None
-
-    # ML Pipeline
-    try:
-        pipe_ml = Pipeline([
-            ("name_dropper", TrainDropper()),
-            ("outlier_dropper", OutlierRemover()),
-        ])
-
-        df_ml = pipe_ml.fit_transform(df_analysis)
-        
-        output_path_processed = f'data/processed_{filename}.csv'
-        df_ml.to_csv(output_path_processed, index=False)
-        logger.info(f"Saved processed data: {output_path_processed} ({len(df_ml)} rows)")
-        
-        return df_ml
-    except Exception as err:
-        logger.error(f"Error in ML pipeline: {err}")
-        return None
-
-
-def process_tier(tier_name: str, fetch_func, use_masters: bool = False):
-    """Generic function to process a rank tier."""
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Processing {tier_name.upper()} tier")
-    logger.info(f"{'='*60}")
-    
-    entries = fetch_func()
-    if not entries:
-        logger.warning(f"No {tier_name} entries found")
-        return None
-    
-    puuids = resolve_puuids(entries)
-    if not puuids:
-        logger.warning(f"No PUUIDs resolved for {tier_name}")
-        return None
-    
-    match_ids = get_match_ids(puuids)
-    if not match_ids:
-        logger.warning(f"No matches found for {tier_name}")
-        return None
-    
-    match_data = get_match_data(match_ids)
-    if match_data.empty:
-        logger.warning(f"{tier_name} match data is empty")
-        return None
-    
-    # Save checkpoint before pipeline
-    save_checkpoint(match_data, tier_name)
-    
-    # Process through pipeline
-    processed_data = use_data_pipeline(match_data, f'{tier_name}_match_data')
-    
-    return processed_data
-
-
-def main():
-    """Main execution function."""
-    start_time = time.time()
-    logger.info("="*70)
-    logger.info("TFT DATA COLLECTOR V3 - OPTIMIZED")
-    logger.info("="*70)
-    logger.info(f"Platform Region: {PLATFORM_REGION}")
-    logger.info(f"Match Region: {MATCH_REGION}")
-    logger.info(f"API Key: {'*' * 20}{API_KEY[-8:]}")
-    
-    results = {}
-    
-    # Process Challengers
-    results['challenger'] = process_tier('challenger', get_challengers)
-    
-    # Process Grandmasters
-    #results['grandmaster'] = process_tier('grandmaster', get_gms)
-    
-    # Summary
-    elapsed = time.time() - start_time
-    logger.info("\n" + "="*70)
-    logger.info("COLLECTION SUMMARY")
-    logger.info("="*70)
-    for tier, data in results.items():
-        if data is not None:
-            logger.info(f"{tier.capitalize()}: {len(data)} processed records")
-        else:
-            logger.info(f"{tier.capitalize()}: No data collected")
-    logger.info(f"\nTotal execution time: {elapsed/60:.2f} minutes")
-    logger.info("="*70)
-
+        print("ETL Process Completed!")
 
 if __name__ == "__main__":
-    main()
+    if API_KEY == 'RGAPI-YOUR-KEY-HERE':
+        print("Please update the API_KEY in the script before running.")
+    else:
+        etl = TftETL(API_KEY, PLATFORM_REGION, MATCH_REGION)
+        etl.run()
