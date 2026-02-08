@@ -13,7 +13,7 @@ load_dotenv()
 API_KEY = os.getenv("RIOT_API_KEY")
 PLATFORM_REGION = "euw1"       # Regional endpoint for league/summoner data
 MATCH_REGION = "europe"        # Routing endpoint for match data
-MATCHES_PER_PLAYER = 50
+MATCHES_PER_PLAYER = 10
 RAW_DATA_PATH = "data/raw_matches.json"
 OUTPUT_CSV_PATH = "data/match_data.csv"
 
@@ -70,7 +70,7 @@ def get_league_puuids(watcher, region, tier):
             return []
 
         entries = league.get("entries", [])
-        puuids = [e["puuid"] for e in entries if "puuid" in e]
+        puuids = [e["puuid"] for e in entries if "puuid" in e][:100]
         print(f"  Found {len(puuids)} {tier} players")
         return puuids
 
