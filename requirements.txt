@@ -1,0 +1,6 @@
+requests
+riotwatcher
+pandas
+numpy
+flatten_json
+python-dotenv
