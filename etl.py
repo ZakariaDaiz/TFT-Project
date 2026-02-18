@@ -161,8 +161,6 @@ def flatten_match(match, champ_map, item_map):
             return []
 
         row = {
-            "match_id": match_id,
-            "game_version": game_version,
             "placement": p.get("placement"),
             "level": p.get("level"),
             "gold_left": p.get("gold_left"),
