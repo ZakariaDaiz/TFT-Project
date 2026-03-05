@@ -13,7 +13,7 @@ load_dotenv()
 API_KEY = os.getenv("RIOT_API_KEY")
 PLATFORM_REGION = "euw1"       # Regional endpoint for league/summoner data
 MATCH_REGION = "europe"        # Routing endpoint for match data
-MATCHES_PER_PLAYER = 10
+MATCHES_PER_PLAYER = 50
 RAW_DATA_PATH = "data/raw_matches.json"
 OUTPUT_CSV_PATH = "data/match_data.csv"
 

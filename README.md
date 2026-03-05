@@ -1,124 +1,179 @@
-# PH Teamfight Tactics Data Analysis (Upgrade)
+# TFT Placement Predictor
 
-## Introduction & Goal
+An educational data science project built to demonstrate ETL pipeline construction and machine learning model training using real competitive game data.
 
-This project is a modernization and upgrade of the existing [PH-TFT project](https://github.com/rndmagtanong/ph_tft). The goal is to rework the core components to meet today's standards and improve performance.
+This project collects match data from Riot Games' Teamfight Tactics API for the top EUW players (Challenger & Grandmaster), processes it into a structured dataset, performs exploratory data analysis, and trains a CatBoost classifier to predict match placements.
 
-**Main improvements:**
-*   **ETL Rework:** Updating the Extract, Transform, Load pipeline to be fully compatible with the current Riot Games API.
-*   **Model Training Upgrade:** Transitioning from a standard confusion matrix approach to **CatBoost** (with GX training) to significantly increase prediction accuracy.
+> This is a modernization of the original [PH-TFT project](https://github.com/rndmagtanong/ph_tft), upgraded from RandomForest to CatBoost and rebuilt with a fully functional ETL pipeline compatible with the current Riot API.
 
-## TL;DR
-
-An ETL pipeline was built to get match data of PH Challenger/GM+ players for the game Teamfight Tactics using the Riot Developer API. The data is then preprocessed into .csv files and analyzed with data analysis techniques. Afterwards, a model is trained to predict where a certain combination of units/traits/items would place if played in-game.
-
-## Code and Resources Used
-
-- Python Version: 3.10
-- Packages: matplotlib, numpy, pandas, re, requests, seaborn, sklearn, flatten_json, catboost
-- Riot Developer API: https://developer.riotgames.com/apis
+---
 
 ## Table of Contents
 
-- [What is TFT?](#teamfight-tactics)
-- [Data Collection](#data-collection)
+- [What is TFT?](#what-is-tft)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [How to Run](#how-to-run)
+- [ETL Pipeline](#etl-pipeline)
 - [Exploratory Data Analysis](#exploratory-data-analysis)
-- [Placement Predictor](#placement-predictor)
-- [Conclusion](#conclusion)
-- [Recommendations](#recommendations)
-- [EDA Graphs](#results)
+- [Model Training](#model-training)
+- [Results](#results)
+- [Limitations & Recommendations](#limitations--recommendations)
 
-## Teamfight Tactics
+---
 
-Teamfight Tactics (hereafter TFT), published by Riot Games, is an auto-battler type game wherein a player chooses a combination of traits, units, augments, and items to use in order to gain a placement between 1st and 8th. Generally, placements from 1st to 4th net a positive amount of League Points or LP, whereas placements from 5th to 8th lose LP. Thus, the goal of the game is to end on a combination that places you as high as possible to gain as much LP as possible. The game itself, however, has a lot of variance, so only the best players can tighten this variance enough to tighten this variance enough for a high average placement. Thus, this project aims to answer the questions: what makes for a winning combination, and can it be predicted?
+## What is TFT?
 
-## Data Collection
+Teamfight Tactics (TFT) is an auto-battler game by Riot Games where 8 players compete by assembling combinations of units, traits, augments, and items. Each game ends with placements from 1st to 8th. Placements 1–4 count as wins (gain LP), placements 5–8 count as losses (lose LP).
 
-The data used was collected on March 16, 2023, during the Set 8 period of the game TFT by Riot Games. Developer access was requested and granted, then the `requests` library was used to first identify the best players of the region, then get their names, then their player universally unique IDentifiers, and finally the last 50 matches that they each had played.
+The core question this project tries to answer: **can we predict where a given board composition will place?**
 
-Since this process could and should be done repeatedly, a pipeline was created using `sklearn.pipeline` to drop matches played in the non-ranked game modes. Some preprocessing is also done at this step including dropping full NaN columns, deleting columns that contain 'garbage' data, resetting the index, and describing the amount of missing data (which there should be a lot of considering the high dimensionality of TFT). This iteration is then saved to a *.csv* file for data analysis.
+---
 
-From here, another pipeline is used to created the dataset for the machine learning model. This pipeline deletes columns with cosmetic features that do not affect the result of the game, and columns that have only 10% of its data filled. 
+## Tech Stack
 
-All this can then be done by adding a valid Riot Developer API key then running the script. The output will be four *.csv* files, containing match data of the best players in the PH region.
+- **Python 3.10**
+- **ETL:** `riotwatcher`, `requests`, `pandas`, `python-dotenv`
+- **EDA:** `matplotlib`, `seaborn`
+- **ML:** `catboost`, `scikit-learn`
+- **Data source:** [Riot Games TFT API](https://developer.riotgames.com/apis)
+- **Name resolution:** [Data Dragon](https://developer.riotgames.com/docs/lol#data-dragon)
+
+---
+
+## Project Structure
+
+```
+TFT-Project/
+├── etl.py                    # ETL pipeline (Extract, Transform, Load)
+├── eda.py                    # Exploratory Data Analysis
+├── catBoost.py               # CatBoost model training
+├── requirements.txt          # Python dependencies
+├── .env                      # API key (not committed)
+├── data/
+│   ├── match_data.csv        # Processed match data (generated)
+│   └── raw_matches.json      # Cached raw API responses (generated)
+├── eda/                      # EDA visualizations
+└── confusion_matrixes/       # Model confusion matrices
+```
+
+## ETL Pipeline
+
+The pipeline is split into three phases in `etl.py`:
+
+### Extract
+- Fetches Challenger and Grandmaster player PUUIDs from the TFT League API (up to 100 players per tier)
+- Collects the last **50 match IDs** per player, deduplicated across the full player pool
+- Fetches full match detail JSON for each unique match
+- Raw responses are **cached to `data/raw_matches.json`** so the transform step can be rerun without new API calls
+
+### Transform
+- `flatten_match()` extracts one row per participant (8 rows per match) with:
+  - Placement, level, gold left, last round, damage dealt, players eliminated
+  - Augments (up to 3, stored as separate columns)
+  - Active traits with their unit count
+  - Units with name (resolved via Data Dragon), tier, and equipped items
+- Double Up game mode matches are automatically skipped
+- `clean_dataframe()` drops fully empty columns and rows
+
+### Load
+- Cleaned DataFrame is written to `data/match_data.csv`
+
+**Data flow:**
+```
+Riot API → raw JSON (cached) → flatten_match() → clean_dataframe() → match_data.csv
+```
+
+---
 
 ## Exploratory Data Analysis
 
-With the data collected, it's time to glean insight from them. Some interesting questions to ask are:
+Run `eda.py` after the ETL to generate visualizations in `eda/`. Beyond just plotting distributions, the EDA revealed a critical data quality issue that directly shaped the model.
 
-1. What are the most picked augments at each stage?
-2. What are the least picked (but still picked) augments at each stage?
-3. Which companion_species has the highest winrate?
-4. What is the most used trait?
-5. Which puuid has the highest winrate with at least 50 games played?
-6. Which augment has the highest winrate?
+### Identifying Leaky Features
 
-Please check the results section for the graphs.
+The numeric features vs. placement charts and the correlation heatmap showed that `last_round`, `time_eliminated`, `total_damage_to_players`, and `players_eliminated` all have very strong, near-perfect correlations with placement.
 
-## Placement Predictor
+![Numeric vs Placement](eda/numeric_vs_placement.png)
 
-Finally, can we predict where a certain combination of units/traits/items will place?
+![Numeric Boxplots](eda/numeric_boxplots.png)
 
-First, the data from the best players is combined, and duplicates are removed to avoid reinforcing certain matches in the model. As preprocessing, features that directly impact the strength of a player including their picked augments, traits, units and items were separated from the dataset. The columns are then turned into the proper data types for the model. Another feature is also created which gets the total sum of items a player has. The categorical columns are then one-hot encoded with `pd.get_dummies`, and the NaNs are filled in with 0s.
+![Correlation Heatmap](eda/correlation_heatmap.png)
 
-The placement of a player is then selected as the target. To see the effects, this placement is then binned 3 ways: by 1st to 8th place, by 2 places (e.g. [1st, 2nd], [3rd, 4th]...), and by whether it is a Top 4 (a win) or a Bot 4 (a loss). Train-test splits for these three were then created.
+This correlation is misleading — these features are **consequences of placement, not causes**. A player who finishes 1st naturally survives more rounds, deals more damage over time, and eliminates more opponents. Including them would teach the model to predict "how long did you play" rather than "is this composition strong." This was confirmed after an initial training run where the feature importance showed these four features accounting for **~84% of the model's total importance**, leaving only 16% for the actual composition data.
 
-A **CatBoost** model (with GX training) is used to improve prediction accuracy, replacing the previous RandomForestClassifier approach. CatBoost is particularly well-suited for handling categorical data and providing high accuracy in ranking tasks.
+These features were removed before final model training.
 
-![8 Bins](confusion_matrixes/confusion_matrix_8.png)
+### Placement Distribution
+![Placement Distribution](eda/placement_distribution.png)
 
-If separated into 8 bins, the accuracy of the model is only 0.306. It does not help that TFT has high dimensionality and that the dataset is only able to capture the very end of a match, making it so that combinations that **should** surely get a certain place may differ by a magnitude of 1 or 2 places.
+### Most Played Traits
+![Top Traits](eda/top_traits.png)
 
-![4 Bins](confusion_matrixes/confusion_matrix_4.png)
+### Average Placement by Trait
+![Trait Average Placement](eda/trait_avg_placement.png)
 
-If separated into 4 bins, the accuracy of the model increases to 0.550. Better, but still not in the desired ~0.7 range for a useful model.
+### Most Played Units
+![Top Units](eda/top_units.png)
 
-![2 Bins](confusion_matrixes/confusion_matrix_2.png)
 
-If separated into 2 bins, the accuracy of the model is now 0.804, within a useful range. This version is actually the more useful and realistic one, since placements from 1-4 count as wins, while placements from 5-8 count as losses. If the only goal is to win as much as possible, then this model should suffice. However, as mentioned, there are dimensions about the game that could not be captured by the dataset, so just because a "winning" composition has been assembled doesn't mean it's an automatic win.
+---
 
-## Conclusion
+## Model Training
 
-It is indeed possible to somewhat predict if a person will win/lose using machine learning. From the results, if one simply aims to win/lose, they can most likely pick the highest winrate augments, traits and units from the data analysis and get a pretty good winrate. It may also be wise to study and observe how the best players end their compositions.
+`catBoost.py` trains a **CatBoost multi-class classifier** to predict placement (1–8).
 
-## Recommendations
+**Why CatBoost?**
+- Handles categorical features (unit names, augment names, trait names) natively without manual encoding
+- Strong out-of-the-box performance on tabular data
+- Built-in support for early stopping to prevent overfitting
 
-Two main recommendations follow: firstly, to use more data while avoiding cross-contamination between patches, and secondly to bin the data according to matches, not as a collection. 
+**Configuration:**
+```python
+CatBoostClassifier(
+    iterations=500,
+    depth=6,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function='MultiClass',
+    early_stopping_rounds=50,
+)
+```
 
-This data both uses a small sample size of the arguably best players and also only their last 50 matches as that should be in line with patches 13.4 and 13.5. These patches can and usually do significantly change how well certain traits, units and items do, so the entire process should be rerun every patch cycle to get the correct data.
+- 80/20 train/test split with a fixed random seed for reproducibility
+- Categorical features are auto-detected from string/category dtype columns
+- Early stopping monitors the test set and halts training when accuracy plateaus
+- After training, the top 20 most important features are printed
+- The trained model is saved to `catboost_model.cbm` for reuse
 
-Also, the matches are treated as individuals, not by 8s as the games are played, so it might be wise to find a way to somehow train the model to see patterns within the match itself (e.g. if a combination is naturally good against another combination) to reduce the variance.
+---
 
 ## Results
 
-### Most Picked Augments
-![Most Picked Augments at 2-1](eda/most_picked_2-1.png)
+### Confusion Matrices
 
-![Most Picked Augments at 3-2](eda/most_picked_3-2.png)
+#### 8-Class — Predict exact placement (1st through 8th)
 
-![Most Picked Augments at 4-2](eda/most_picked_4-2.png)
+![8-class confusion matrix](confusion_matrixes/confusion_matrix_8.png)
 
-### Least Picked Augments
-![Least Picked Augments at 2-1](eda/least_picked_2-1.png)
+**Accuracy: 36.5%**
 
-![Least Picked Augments at 2-1](eda/least_picked_3-2.png)
+Predicting exact placement out of 8 is the hardest task. Random chance would be 12.5%, so the model is extracting real signal from composition data — but TFT's inherent variance puts a hard ceiling on this framing.
 
-![Least Picked Augments at 2-1](eda/least_picked_4-2.png)
+#### 4-Class — Paired placements ([1,2], [3,4], [5,6], [7,8])
 
-### Species Placement
-![Species Placement](eda/species_placement.png)
+![4-class confusion matrix](confusion_matrixes/confusion_matrix_4.png)
 
-### Most Used Trait
-![Most/Least Used Traits](eda/trait_frequency.png)
+**Accuracy: 50.3%**
 
-### Highest WR Player
-![Player WR](eda/player_ave_placement.png)
+Grouping placements into pairs improves accuracy significantly. The model captures meaningful patterns about which compositions tend to finish in the top vs. bottom half of each bracket.
 
-### Highest WR Augment
-![High WR Augment Place](eda/augment_top4_placements.png)
+#### 2-Class — Top 4 win vs. Bottom 4 loss
 
-![High WR Augment Count](eda/augment_top4_freq.png)
+![2-class confusion matrix](confusion_matrixes/confusion_matrix_2.png)
 
-![Low WR Augment Place](eda/augment_bot4_placements.png)
+**Accuracy: 84.5%**
 
-![Low WR Augment Count](eda/augment_bot4_freq.png)
+The most practically useful framing, directly aligned with how TFT is played — a win is top 4, a loss is bottom 4. The model performs well enough here to be genuinely informative about which compositions are strong.
+
+---

@@ -4,3 +4,4 @@ pandas
 numpy
 flatten_json
 python-dotenv
+optuna
